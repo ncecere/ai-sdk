@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +43,27 @@ func (c *Client) embeddingsURL() string {
 		return c.baseURL + "/embeddings"
 	}
 	return c.baseURL + "/v1/embeddings"
+}
+
+func (c *Client) imagesURL() string {
+	if strings.HasSuffix(c.baseURL, "/v1") {
+		return c.baseURL + "/images/generations"
+	}
+	return c.baseURL + "/v1/images/generations"
+}
+
+func (c *Client) audioSpeechURL() string {
+	if strings.HasSuffix(c.baseURL, "/v1") {
+		return c.baseURL + "/audio/speech"
+	}
+	return c.baseURL + "/v1/audio/speech"
+}
+
+func (c *Client) audioTranscriptionsURL() string {
+	if strings.HasSuffix(c.baseURL, "/v1") {
+		return c.baseURL + "/audio/transcriptions"
+	}
+	return c.baseURL + "/v1/audio/transcriptions"
 }
 
 // NewClient creates a new OpenAI client.
@@ -88,6 +112,21 @@ func (c *Client) ChatModel(model string) provider.LanguageModel {
 // EmbeddingModel returns an EmbeddingModel for the given embedding model ID.
 func (c *Client) EmbeddingModel(model string) provider.EmbeddingModel {
 	return &embeddingModel{client: c, model: model}
+}
+
+// ImageModel returns an ImageModel for the given image model ID.
+func (c *Client) ImageModel(model string) provider.ImageModel {
+	return &imageModel{client: c, model: model}
+}
+
+// SpeechModel returns a SpeechModel for the given text-to-speech model ID.
+func (c *Client) SpeechModel(model string) provider.SpeechModel {
+	return &speechModel{client: c, model: model}
+}
+
+// TranscriptionModel returns a TranscriptionModel for the given transcription model ID.
+func (c *Client) TranscriptionModel(model string) provider.TranscriptionModel {
+	return &transcriptionModel{client: c, model: model}
 }
 
 type chatModel struct {
@@ -467,6 +506,244 @@ func (m *embeddingModel) Generate(ctx context.Context, req *provider.EmbeddingRe
 		res.Embeddings = append(res.Embeddings, d.Embedding)
 	}
 	return res, nil
+}
+
+type imageModel struct {
+	client *Client
+	model  string
+}
+
+type openAIImageRequest struct {
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model"`
+	Size           string `json:"size,omitempty"`
+	N              int    `json:"n,omitempty"`
+	ResponseFormat string `json:"response_format,omitempty"`
+	User           string `json:"user,omitempty"`
+}
+
+type openAIImageResponse struct {
+	Data []struct {
+		URL     *string `json:"url,omitempty"`
+		B64JSON *string `json:"b64_json,omitempty"`
+	} `json:"data"`
+}
+
+func (m *imageModel) Generate(ctx context.Context, req *provider.ImageRequest) (*provider.ImageResponse, error) {
+	body := openAIImageRequest{
+		Model:  m.model,
+		Prompt: req.Prompt,
+	}
+	if req.Size != "" {
+		body.Size = req.Size
+	}
+	if req.NumberOfImages > 0 {
+		body.N = req.NumberOfImages
+	}
+	if req.ResponseFormat != "" {
+		body.ResponseFormat = req.ResponseFormat
+	}
+	if req.UserID != "" {
+		body.User = req.UserID
+	}
+
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.client.imagesURL(), bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range m.client.headers {
+		for _, v := range vs {
+			if v == "" {
+				continue
+			}
+			httpReq.Header.Add(k, v)
+		}
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+m.client.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := m.client.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+
+	var out openAIImageResponse
+	if err := providerutil.ReadJSON(resp, &out); err != nil {
+		return nil, err
+	}
+
+	res := &provider.ImageResponse{}
+	for _, d := range out.Data {
+		var img provider.Image
+		if d.URL != nil && *d.URL != "" {
+			img.URL = *d.URL
+		}
+		if d.B64JSON != nil && *d.B64JSON != "" {
+			data, err := base64.StdEncoding.DecodeString(*d.B64JSON)
+			if err != nil {
+				return nil, err
+			}
+			img.Data = data
+		}
+		res.Images = append(res.Images, img)
+	}
+
+	return res, nil
+}
+
+type speechModel struct {
+	client *Client
+	model  string
+}
+
+type openAISpeechRequest struct {
+	Model          string `json:"model"`
+	Input          string `json:"input"`
+	Voice          string `json:"voice,omitempty"`
+	ResponseFormat string `json:"response_format,omitempty"`
+}
+
+func (m *speechModel) Generate(ctx context.Context, req *provider.SpeechRequest) (*provider.SpeechResponse, error) {
+	body := openAISpeechRequest{
+		Model: m.model,
+		Input: req.Input,
+	}
+	if req.Voice != "" {
+		body.Voice = req.Voice
+	}
+	if req.Format != "" {
+		body.ResponseFormat = req.Format
+	}
+
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.client.audioSpeechURL(), bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range m.client.headers {
+		for _, v := range vs {
+			if v == "" {
+				continue
+			}
+			httpReq.Header.Add(k, v)
+		}
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+m.client.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := m.client.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+		return nil, fmt.Errorf("provider: http status %d: %s", resp.StatusCode, string(b))
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return &provider.SpeechResponse{
+		Audio:    data,
+		MimeType: resp.Header.Get("Content-Type"),
+	}, nil
+}
+
+type transcriptionModel struct {
+	client *Client
+	model  string
+}
+
+type openAITranscriptionResponse struct {
+	Text string `json:"text"`
+}
+
+func (m *transcriptionModel) Generate(ctx context.Context, req *provider.TranscriptionRequest) (*provider.TranscriptionResponse, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	filename := req.FileName
+	if filename == "" {
+		filename = "audio"
+	}
+
+	filePart, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := filePart.Write(req.Audio); err != nil {
+		return nil, err
+	}
+
+	if err := writer.WriteField("model", m.model); err != nil {
+		return nil, err
+	}
+	if req.Prompt != "" {
+		if err := writer.WriteField("prompt", req.Prompt); err != nil {
+			return nil, err
+		}
+	}
+	if req.Language != "" {
+		if err := writer.WriteField("language", req.Language); err != nil {
+			return nil, err
+		}
+	}
+	if req.Temperature != nil {
+		if err := writer.WriteField("temperature", strconv.FormatFloat(*req.Temperature, 'f', -1, 64)); err != nil {
+			return nil, err
+		}
+	}
+	if req.UserID != "" {
+		if err := writer.WriteField("user", req.UserID); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.client.audioTranscriptionsURL(), &buf)
+	if err != nil {
+		return nil, err
+	}
+	for k, vs := range m.client.headers {
+		for _, v := range vs {
+			if v == "" {
+				continue
+			}
+			httpReq.Header.Add(k, v)
+		}
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+m.client.apiKey)
+	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := m.client.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+
+	var out openAITranscriptionResponse
+	if err := providerutil.ReadJSON(resp, &out); err != nil {
+		return nil, err
+	}
+
+	return &provider.TranscriptionResponse{
+		Text: out.Text,
+	}, nil
 }
 
 // CompatibleClient returns a new Client configured for an OpenAI-compatible endpoint.
